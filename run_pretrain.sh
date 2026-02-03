@@ -34,7 +34,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-./output/wan22_pretrain}"
 # Set these 3 values to control training:
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"       # Per-GPU batch size (limited by GPU memory)
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"     # Total samples per optimizer step
-NUM_ITERATIONS="${NUM_ITERATIONS:-1000}"         # Total training steps
+NUM_ITERATIONS="${NUM_ITERATIONS:-20}"         # Total training steps
 
 # Distributed config
 NNODES="${NNODES:-1}"
@@ -82,7 +82,7 @@ CP_SIZE="${CP_SIZE:-1}"
 TP_SIZE="${TP_SIZE:-1}"
 # Note: fuse_wgrad_accumulation requires ZeRO-1 (optim), NOT ZeRO-3 (optim_grads_params)
 # ZeRO-3 shards parameters which breaks cuBLAS GEMM for wgrad accumulation
-ZERO_DP_STRATEGY="${ZERO_DP_STRATEGY:-optim}"
+ZERO_DP_STRATEGY="${ZERO_DP_STRATEGY:-optim_grads_params}"
 OUTER_DP_STRATEGY="${OUTER_DP_STRATEGY:-no_shard}"
 PARAM_DTYPE="${PARAM_DTYPE:-bf16}"
 
@@ -92,7 +92,7 @@ USE_TE_LINEAR="${USE_TE_LINEAR:-true}"   # Replace nn.Linear with TE Linear
 # NOTE: fuse_wgrad_accumulation is INCOMPATIBLE with FSDP!
 # TE's internal wgrad GEMM path uses cuBLAS algorithms that don't work with FSDP tensor layouts.
 # If you need fuse_wgrad, you must use Megatron-Core DDP + DistributedOptimizer instead of FSDP.
-TE_FUSE_WGRAD="${TE_FUSE_WGRAD:-false}"  # MUST be false when using FSDP
+TE_FUSE_WGRAD="${TE_FUSE_WGRAD:-true}"  # MUST be false when using FSDP
 
 # Checkpointing
 SAVE_STEPS="${SAVE_STEPS:-1000}"

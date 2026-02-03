@@ -226,7 +226,7 @@ def save_checkpoint(model, optimizer, step, args, rank):
 
 
 def train(model, text_encoder, vae, data_iter, optimizer, scheduler, criterion,
-          args, rank, device, param_dtype, config):
+          args, rank, device, param_dtype, config, te_grad_buffer=None):
     """Main training loop - iteration based, no epochs."""
     
     model.train()
@@ -266,6 +266,10 @@ def train(model, text_encoder, vae, data_iter, optimizer, scheduler, criterion,
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
+        
+        # Zero TE gradient buffer for next step
+        if te_grad_buffer is not None:
+            te_grad_buffer.zero_grad()
         
         # Logging
         if step % args.log_steps == 0 and rank == 0:
@@ -369,11 +373,11 @@ def main():
     )
     logger.info("Megatron-FSDP ready")
     
-    # Set up TE Linear gradient accumulation (FSDP-compatible)
-    te_grad_accumulator = None
+    # Set up TE Linear gradient accumulation with contiguous buffer (FSDP-compatible)
+    te_grad_buffer = None
     if args.use_te_linear and args.te_fuse_wgrad:
         from te_utils import setup_main_grad_for_te_linear
-        setup_main_grad_for_te_linear(model)
+        te_grad_buffer = setup_main_grad_for_te_linear(model)
     
     # Dataset + infinite iterator
     dataset = MockDataset(args.num_samples, args.frame_num, tuple(args.resolution))
@@ -394,7 +398,7 @@ def main():
     # Train
     logger.info("Starting training...")
     train(model, text_encoder, vae, data_iter, optimizer, scheduler, criterion,
-          args, rank, device, param_dtype, config)
+          args, rank, device, param_dtype, config, te_grad_buffer=te_grad_buffer)
     
     logger.info("Training completed!")
     if dist.is_initialized():

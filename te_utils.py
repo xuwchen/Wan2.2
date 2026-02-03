@@ -190,54 +190,273 @@ def is_te_available() -> bool:
     return TE_AVAILABLE
 
 
-def setup_main_grad_for_te_linear(model: nn.Module) -> int:
+class TEMainGradBuffer:
     """
-    Set up TE Linear layers for gradient accumulation with Megatron-FSDP.
+    Contiguous gradient buffer for TE Linear layers.
     
-    This should be called AFTER FSDP wrapping. Since Megatron-FSDP doesn't 
-    automatically set up get_main_grad for TE Linear layers, we manually
-    create the main_grad buffer and set __fsdp_param__ = True to make TE
-    use torch.matmul instead of cuBLAS accumulation mode.
+    This is similar to Megatron-FSDP's param_and_grad_buffer implementation.
+    It allocates a single contiguous buffer for all TE Linear weight gradients,
+    which satisfies cuBLAS GEMM alignment requirements.
+    
+    Each weight's get_main_grad() returns a view into this contiguous buffer.
+    
+    Usage:
+        # After FSDP wrapping
+        grad_buffer = TEMainGradBuffer(model)
+        
+        # Before first microbatch of each step
+        grad_buffer.zero_grad()
+        
+        # Training loop works with fuse_wgrad_accumulation=True
+    """
+    
+    def __init__(self, model: nn.Module, alignment: int = 128):
+        """
+        Initialize the contiguous gradient buffer.
+        
+        Args:
+            model: Model containing TE Linear layers (after FSDP wrapping)
+            alignment: Memory alignment in elements (default: 128 for cuBLAS)
+        """
+        self.model = model
+        self.alignment = alignment
+        self.buffer = None
+        self.weight_info = []  # List of (name, weight, offset, numel)
+        
+        if not TE_AVAILABLE:
+            print("Warning: TransformerEngine not available")
+            return
+        
+        self._setup_buffer()
+    
+    def _align_offset(self, offset: int) -> int:
+        """Align offset to the required boundary."""
+        return ((offset + self.alignment - 1) // self.alignment) * self.alignment
+    
+    def _setup_buffer(self):
+        """Collect TE Linear weights and allocate contiguous buffer."""
+        # First pass: collect weights and calculate total size
+        total_size = 0
+        weights_to_setup = []
+        
+        for name, module in self.model.named_modules():
+            if isinstance(module, te.Linear):
+                if getattr(module, 'fuse_wgrad_accumulation', False):
+                    weight = module.weight
+                    numel = weight.numel()
+                    
+                    # Calculate aligned offset
+                    aligned_offset = self._align_offset(total_size)
+                    
+                    weights_to_setup.append({
+                        'name': name,
+                        'module': module,
+                        'weight': weight,
+                        'offset': aligned_offset,
+                        'numel': numel,
+                        'shape': weight.shape,
+                        'dtype': weight.dtype,
+                        'device': weight.device,
+                    })
+                    
+                    total_size = aligned_offset + numel
+        
+        if not weights_to_setup:
+            print("No TE Linear layers with fuse_wgrad_accumulation found")
+            return
+        
+        # Get dtype and device from first weight
+        dtype = weights_to_setup[0]['dtype']
+        device = weights_to_setup[0]['device']
+        
+        # Align total size
+        total_size = self._align_offset(total_size)
+        
+        # Allocate contiguous buffer
+        self.buffer = torch.zeros(total_size, dtype=dtype, device=device)
+        
+        buffer_mb = total_size * self.buffer.element_size() / 1024 / 1024
+        print(f"Allocated contiguous main_grad buffer: {total_size} elements ({buffer_mb:.2f} MB)")
+        
+        # Second pass: set up get_main_grad for each weight
+        for info in weights_to_setup:
+            weight = info['weight']
+            offset = info['offset']
+            numel = info['numel']
+            shape = info['shape']
+            name = info['name']
+            
+            # Store info for debugging
+            self.weight_info.append((name, weight, offset, numel))
+            
+            # Set __fsdp_param__ = True so TE uses get_main_grad() path
+            weight.__fsdp_param__ = True
+            
+            # Create get_main_grad method that returns a VIEW into the contiguous buffer
+            # The key: the view has the right shape but underlying data is contiguous
+            # We also set __fsdp_param__ on the view so patched_general_gemm can detect it
+            def make_getter(buf, off, num, shp):
+                def getter():
+                    view = buf[off:off + num].view(shp)
+                    view.__fsdp_param__ = True  # Mark for patched gemm detection
+                    return view
+                return getter
+            
+            weight.get_main_grad = make_getter(self.buffer, offset, numel, shape)
+        
+        print(f"Configured {len(weights_to_setup)} TE Linear layers with contiguous main_grad buffer")
+        
+        # Print first few for verification
+        for name, weight, offset, numel in self.weight_info[:3]:
+            print(f"  {name}: offset={offset}, numel={numel}, shape={tuple(weight.shape)}")
+        if len(self.weight_info) > 3:
+            print(f"  ... and {len(self.weight_info) - 3} more")
+    
+    def zero_grad(self):
+        """Zero the gradient buffer. Call before each optimizer step."""
+        if self.buffer is not None:
+            self.buffer.zero_()
+    
+    def get_buffer(self) -> torch.Tensor:
+        """Get the underlying contiguous buffer tensor."""
+        return self.buffer
+    
+    def get_total_grad_norm(self, norm_type: float = 2.0) -> torch.Tensor:
+        """Compute the gradient norm across all TE Linear weights."""
+        if self.buffer is None:
+            return torch.tensor(0.0)
+        return torch.norm(self.buffer, p=norm_type)
+    
+    def num_weights(self) -> int:
+        """Return the number of weights managed by this buffer."""
+        return len(self.weight_info)
+
+
+def setup_main_grad_for_te_linear(model: nn.Module) -> TEMainGradBuffer:
+    """
+    Set up TE Linear layers for gradient accumulation with a contiguous buffer.
+    
+    This creates a contiguous gradient buffer similar to Megatron-FSDP's
+    param_and_grad_buffer, which satisfies cuBLAS GEMM alignment requirements.
+    
+    This should be called AFTER FSDP wrapping.
     
     Args:
         model: The model (after FSDP wrapping)
     
     Returns:
-        Number of TE Linear layers configured
+        TEMainGradBuffer object managing the gradient buffer
     """
-    if not TE_AVAILABLE:
-        return 0
+    buffer = TEMainGradBuffer(model)
     
-    count = 0
+    # Monkey-patch TE Linear to use torch.matmul instead of cuBLAS for wgrad
+    # This is necessary because cuBLAS GEMM accumulation mode (beta=1) is
+    # incompatible with FSDP tensor layouts
+    _patch_te_linear_for_fsdp()
     
-    for name, module in model.named_modules():
-        if isinstance(module, te.Linear):
-            if getattr(module, 'fuse_wgrad_accumulation', False):
-                weight = module.weight
-                
-                # Create a contiguous main_grad buffer
-                if not hasattr(weight, 'main_grad') or weight.main_grad is None:
-                    weight.main_grad = torch.zeros(
-                        weight.shape,
-                        dtype=weight.dtype,
-                        device=weight.device,
-                    ).contiguous()
-                
-                # Set __fsdp_param__ = True to trigger TE's torch.matmul path
-                # This avoids the cuBLAS accumulation mode (beta=1) which is
-                # incompatible with FSDP tensor layouts
-                weight.__fsdp_param__ = True
-                
-                # Create get_main_grad method that returns the main_grad buffer
-                # TE will call this in backward to get the output buffer for wgrad
-                def make_getter(w):
-                    return lambda: w.main_grad
-                weight.get_main_grad = make_getter(weight)
-                
-                count += 1
+    return buffer
+
+
+_TE_PATCHED = False
+_ORIGINAL_GENERAL_GEMM = None
+
+def _patch_te_linear_for_fsdp():
+    """
+    Monkey-patch TE Linear's backward to use torch.matmul for wgrad when
+    __fsdp_param__ is set. This avoids the cuBLAS_STATUS_NOT_SUPPORTED error.
     
-    print(f"Configured {count} TE Linear layers with manual FSDP-compatible main_grad")
-    return count
+    We need to patch multiple locations:
+    1. transformer_engine.pytorch.cpp_extensions.gemm.general_gemm
+    2. transformer_engine.pytorch.module.linear.general_gemm (the imported reference)
+    """
+    global _TE_PATCHED, _ORIGINAL_GENERAL_GEMM
+    if _TE_PATCHED or not TE_AVAILABLE:
+        return
+    
+    try:
+        from transformer_engine.pytorch.cpp_extensions import gemm as te_gemm
+        from transformer_engine.pytorch.module import linear as te_linear_module
+        
+        # Save original general_gemm
+        _ORIGINAL_GENERAL_GEMM = te_gemm.general_gemm
+        
+        def patched_general_gemm(A, B, out_dtype=None, quantization_params=None,
+                                  gelu=False, gelu_in=None, alpha=1.0, beta=None,
+                                  accumulate=False, layout="TN", out=None, bias=None,
+                                  use_split_accumulator=False, grad=False, ub=None,
+                                  ub_type=None, extra_output=None, bulk_overlap=False):
+            """
+            Patched general_gemm that uses torch.matmul when:
+            1. out is provided (main_grad buffer for wgrad)
+            2. grad=True (gradient computation)
+            
+            This avoids cuBLAS_STATUS_NOT_SUPPORTED errors with FSDP.
+            cuBLAS often fails with non-standard tensor layouts even without accumulate.
+            """
+            # When out is provided and this is gradient computation, use torch.matmul
+            # This handles both first microbatch (accumulate=False) and subsequent ones (accumulate=True)
+            use_torch_matmul = (
+                out is not None and
+                grad  # Only for gradient computation (wgrad)
+            )
+            
+            if use_torch_matmul:
+                # Use torch.matmul instead of cuBLAS
+                # For wgrad: dW = dY^T @ X (layout="NT")
+                # A = input (X), B = grad_output (dY)
+                
+                # Flatten 3D tensors to 2D for matmul
+                # Input may be [batch, seq, hidden] -> [batch*seq, hidden]
+                A_2d = A.reshape(-1, A.shape[-1]) if A.dim() == 3 else A
+                B_2d = B.reshape(-1, B.shape[-1]) if B.dim() == 3 else B
+                
+                if layout == "NT":
+                    # dW = B^T @ A -> [out_features, batch*seq] @ [batch*seq, in_features]
+                    result = torch.matmul(B_2d.t(), A_2d)
+                elif layout == "TN":
+                    # dW = A^T @ B -> [in_features, batch*seq] @ [batch*seq, out_features]
+                    result = torch.matmul(A_2d.t(), B_2d)
+                else:
+                    # NN layout
+                    result = torch.matmul(A_2d, B_2d)
+                
+                # Handle accumulate mode
+                if accumulate:
+                    # Accumulate into out (add to existing gradients)
+                    out.add_(result)
+                else:
+                    # First microbatch: copy result to out (overwrite)
+                    out.copy_(result)
+                
+                # Handle bias gradient if needed
+                grad_bias = None
+                if bias is not None:
+                    grad_bias = B.sum(dim=0) if B.dim() == 2 else B.sum(dim=tuple(range(B.dim()-1)))
+                
+                return out, grad_bias, None, None
+            
+            # Fall back to original cuBLAS implementation
+            return _ORIGINAL_GENERAL_GEMM(
+                A, B, out_dtype=out_dtype, quantization_params=quantization_params,
+                gelu=gelu, gelu_in=gelu_in, alpha=alpha, beta=beta,
+                accumulate=accumulate, layout=layout, out=out, bias=bias,
+                use_split_accumulator=use_split_accumulator, grad=grad, ub=ub,
+                ub_type=ub_type, extra_output=extra_output, bulk_overlap=bulk_overlap
+            )
+        
+        # Apply patch to BOTH locations
+        # 1. The source module
+        te_gemm.general_gemm = patched_general_gemm
+        # 2. The imported reference in linear.py module
+        te_linear_module.general_gemm = patched_general_gemm
+        
+        _TE_PATCHED = True
+        print("Patched TE general_gemm in both gemm.py and linear.py for FSDP-compatible wgrad accumulation")
+        
+    except Exception as e:
+        import traceback
+        print(f"Warning: Failed to patch TE Linear for FSDP: {e}")
+        traceback.print_exc()
 
 
 class TEGradientAccumulator:
