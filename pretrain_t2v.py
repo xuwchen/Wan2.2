@@ -237,6 +237,10 @@ def train(model, text_encoder, vae, data_iter, optimizer, scheduler, criterion,
     accumulated_loss = 0.0
     
     for step in progress:
+        # Zero TE gradient buffer at the start of each step
+        if te_grad_buffer is not None:
+            te_grad_buffer.zero_grad()
+        
         # Accumulate gradients over micro-batches
         for micro_idx in range(grad_accum):
             batch = next(data_iter)
@@ -262,17 +266,18 @@ def train(model, text_encoder, vae, data_iter, optimizer, scheduler, criterion,
             loss.backward()
             accumulated_loss += loss.item()
         
+        # Sync TE main_grad to weight.grad before optimizer step
+        # (TE writes to main_grad buffer, but optimizer reads weight.grad)
+        if te_grad_buffer is not None:
+            te_grad_buffer.sync_to_weight_grad()
+        
         # Optimizer step
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
         
-        # Zero TE gradient buffer for next step
-        if te_grad_buffer is not None:
-            te_grad_buffer.zero_grad()
-        
-        # Logging
-        if step % args.log_steps == 0 and rank == 0:
+        # Logging - print loss for every iteration
+        if rank == 0:
             lr = optimizer.param_groups[0]["lr"]
             logger.info(f"Step {step}/{args.max_steps} | Loss: {accumulated_loss:.4f} | LR: {lr:.2e}")
             progress.set_postfix(loss=f"{accumulated_loss:.4f}")

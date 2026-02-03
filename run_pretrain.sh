@@ -92,7 +92,7 @@ USE_TE_LINEAR="${USE_TE_LINEAR:-true}"   # Replace nn.Linear with TE Linear
 # NOTE: fuse_wgrad_accumulation is INCOMPATIBLE with FSDP!
 # TE's internal wgrad GEMM path uses cuBLAS algorithms that don't work with FSDP tensor layouts.
 # If you need fuse_wgrad, you must use Megatron-Core DDP + DistributedOptimizer instead of FSDP.
-TE_FUSE_WGRAD="${TE_FUSE_WGRAD:-true}"  # MUST be false when using FSDP
+TE_FUSE_WGRAD="${TE_FUSE_WGRAD:-true}"  # Enable TE gradient accumulation fusion (Megatron-FSDP overwrite_main_grad=False)
 
 # Checkpointing
 SAVE_STEPS="${SAVE_STEPS:-1000}"

@@ -190,15 +190,36 @@ def is_te_available() -> bool:
     return TE_AVAILABLE
 
 
+def to_local_if_dtensor(tensor):
+    """
+    Convert a DTensor to a local tensor (following Megatron-LM's approach).
+    
+    Args:
+        tensor: A tensor that may be a DTensor.
+    Returns:
+        torch.Tensor: The local tensor.
+    """
+    try:
+        from torch.distributed.tensor import DTensor
+        if isinstance(tensor, DTensor):
+            return tensor._local_tensor
+    except ImportError:
+        pass
+    return tensor
+
+
 class TEMainGradBuffer:
     """
-    Contiguous gradient buffer for TE Linear layers.
+    Gradient buffer manager for TE Linear layers with Megatron-FSDP.
     
-    This is similar to Megatron-FSDP's param_and_grad_buffer implementation.
-    It allocates a single contiguous buffer for all TE Linear weight gradients,
-    which satisfies cuBLAS GEMM alignment requirements.
+    This class follows Megatron-LM's approach:
+    1. If Megatron-FSDP already set up main_grad for weights, use those directly
+    2. Otherwise, create a contiguous buffer (fallback for FSDP without Megatron main_grad)
     
-    Each weight's get_main_grad() returns a view into this contiguous buffer.
+    Key insight from Megatron-LM:
+    - When weight is a DTensor (FSDP sharded), use to_local_if_dtensor() to get local shape
+    - The main_grad buffer should be sized for LOCAL shards, not global tensors
+    - sync_to_weight_grad() should copy to weight.grad._local_tensor for DTensor
     
     Usage:
         # After FSDP wrapping
@@ -208,11 +229,12 @@ class TEMainGradBuffer:
         grad_buffer.zero_grad()
         
         # Training loop works with fuse_wgrad_accumulation=True
+        # No need to call sync_to_weight_grad() when using Megatron-FSDP
     """
     
     def __init__(self, model: nn.Module, alignment: int = 128):
         """
-        Initialize the contiguous gradient buffer.
+        Initialize the gradient buffer manager.
         
         Args:
             model: Model containing TE Linear layers (after FSDP wrapping)
@@ -220,8 +242,9 @@ class TEMainGradBuffer:
         """
         self.model = model
         self.alignment = alignment
-        self.buffer = None
-        self.weight_info = []  # List of (name, weight, offset, numel)
+        self.buffer = None  # Only used for fallback (non-FSDP)
+        self.weight_info = []  # List of (name, weight, uses_fsdp_main_grad)
+        self.uses_fsdp_main_grad = False
         
         if not TE_AVAILABLE:
             print("Warning: TransformerEngine not available")
@@ -234,40 +257,83 @@ class TEMainGradBuffer:
         return ((offset + self.alignment - 1) // self.alignment) * self.alignment
     
     def _setup_buffer(self):
-        """Collect TE Linear weights and allocate contiguous buffer."""
-        # First pass: collect weights and calculate total size
-        total_size = 0
-        weights_to_setup = []
+        """
+        Set up TE Linear weights to use appropriate main_grad.
+        
+        Megatron-FSDP sets up get_main_grad() method on each parameter.
+        We check for this and use it directly if available.
+        Otherwise, we create our own buffer (fallback for non-FSDP cases).
+        """
+        weights_with_fsdp_main_grad = []
+        weights_without_main_grad = []
         
         for name, module in self.model.named_modules():
             if isinstance(module, te.Linear):
                 if getattr(module, 'fuse_wgrad_accumulation', False):
                     weight = module.weight
-                    numel = weight.numel()
                     
-                    # Calculate aligned offset
-                    aligned_offset = self._align_offset(total_size)
+                    # Check if Megatron-FSDP already set up get_main_grad
+                    # Megatron-FSDP sets get_main_grad method AND _gbuf/_item_id attributes
+                    has_fsdp_main_grad = (
+                        hasattr(weight, 'get_main_grad') and 
+                        hasattr(weight, '_gbuf') and 
+                        hasattr(weight, '_item_id')
+                    )
                     
-                    weights_to_setup.append({
-                        'name': name,
-                        'module': module,
-                        'weight': weight,
-                        'offset': aligned_offset,
-                        'numel': numel,
-                        'shape': weight.shape,
-                        'dtype': weight.dtype,
-                        'device': weight.device,
-                    })
-                    
-                    total_size = aligned_offset + numel
+                    if has_fsdp_main_grad:
+                        weights_with_fsdp_main_grad.append((name, weight))
+                    else:
+                        weights_without_main_grad.append((name, weight))
         
-        if not weights_to_setup:
+        # Prefer using Megatron-FSDP's main_grad if available
+        if weights_with_fsdp_main_grad:
+            self.uses_fsdp_main_grad = True
+            print(f"Found {len(weights_with_fsdp_main_grad)} TE Linear layers with Megatron-FSDP get_main_grad")
+            
+            for name, weight in weights_with_fsdp_main_grad:
+                # Megatron-FSDP already set __fsdp_param__ = True and get_main_grad
+                # Just record the weight, don't override anything
+                self.weight_info.append((name, weight, True))
+            
+            print(f"Using Megatron-FSDP's get_main_grad for {len(weights_with_fsdp_main_grad)} TE Linear layers")
+            print("  (No separate buffer needed - gradients accumulate in FSDP's grad buffer)")
+            
+            return
+        
+        # Fallback: create our own contiguous buffer (for non-FSDP or testing)
+        if not weights_without_main_grad:
             print("No TE Linear layers with fuse_wgrad_accumulation found")
             return
         
-        # Get dtype and device from first weight
-        dtype = weights_to_setup[0]['dtype']
-        device = weights_to_setup[0]['device']
+        print("Megatron-FSDP main_grad not found, creating standalone buffer (fallback mode)")
+        
+        # Calculate total size needed
+        # IMPORTANT: Use LOCAL shard size for DTensor (FSDP sharded weights)
+        # This follows Megatron-LM's to_local_if_dtensor() approach
+        total_size = 0
+        weights_to_setup = []
+        
+        for name, weight in weights_without_main_grad:
+            # Get local tensor for DTensor (FSDP sharded)
+            local_weight = to_local_if_dtensor(weight)
+            local_numel = local_weight.numel()
+            local_shape = local_weight.shape
+            aligned_offset = self._align_offset(total_size)
+            
+            weights_to_setup.append({
+                'name': name,
+                'weight': weight,
+                'offset': aligned_offset,
+                'numel': local_numel,  # Use LOCAL size
+                'shape': local_shape,  # Use LOCAL shape
+            })
+            
+            total_size = aligned_offset + local_numel
+        
+        # Get dtype and device from first weight (use local tensor)
+        first_local = to_local_if_dtensor(weights_to_setup[0]['weight'])
+        dtype = first_local.dtype
+        device = first_local.device
         
         # Align total size
         total_size = self._align_offset(total_size)
@@ -276,9 +342,9 @@ class TEMainGradBuffer:
         self.buffer = torch.zeros(total_size, dtype=dtype, device=device)
         
         buffer_mb = total_size * self.buffer.element_size() / 1024 / 1024
-        print(f"Allocated contiguous main_grad buffer: {total_size} elements ({buffer_mb:.2f} MB)")
+        print(f"Allocated fallback main_grad buffer: {total_size} elements ({buffer_mb:.2f} MB)")
         
-        # Second pass: set up get_main_grad for each weight
+        # Set up get_main_grad for each weight
         for info in weights_to_setup:
             weight = info['weight']
             offset = info['offset']
@@ -286,46 +352,107 @@ class TEMainGradBuffer:
             shape = info['shape']
             name = info['name']
             
-            # Store info for debugging
-            self.weight_info.append((name, weight, offset, numel))
+            # Store info
+            self.weight_info.append((name, weight, False))
             
             # Set __fsdp_param__ = True so TE uses get_main_grad() path
             weight.__fsdp_param__ = True
             
             # Create get_main_grad method that returns a VIEW into the contiguous buffer
-            # The key: the view has the right shape but underlying data is contiguous
-            # We also set __fsdp_param__ on the view so patched_general_gemm can detect it
             def make_getter(buf, off, num, shp):
                 def getter():
                     view = buf[off:off + num].view(shp)
-                    view.__fsdp_param__ = True  # Mark for patched gemm detection
                     return view
                 return getter
             
             weight.get_main_grad = make_getter(self.buffer, offset, numel, shape)
         
-        print(f"Configured {len(weights_to_setup)} TE Linear layers with contiguous main_grad buffer")
-        
-        # Print first few for verification
-        for name, weight, offset, numel in self.weight_info[:3]:
-            print(f"  {name}: offset={offset}, numel={numel}, shape={tuple(weight.shape)}")
-        if len(self.weight_info) > 3:
-            print(f"  ... and {len(self.weight_info) - 3} more")
+        print(f"Configured {len(weights_to_setup)} TE Linear layers with fallback main_grad buffer")
     
     def zero_grad(self):
-        """Zero the gradient buffer. Call before each optimizer step."""
-        if self.buffer is not None:
+        """
+        Zero the gradient buffer. Call at the start of each step.
+        
+        When using Megatron-FSDP main_grad, this zeros those buffers via get_main_grad().
+        When using fallback mode, this zeros our standalone buffer.
+        """
+        if self.uses_fsdp_main_grad:
+            # Zero each weight's main_grad (managed by Megatron-FSDP)
+            # Use get_main_grad() which returns a view into FSDP's grad buffer
+            for name, weight, _ in self.weight_info:
+                if hasattr(weight, 'get_main_grad'):
+                    try:
+                        main_grad = weight.get_main_grad()
+                        main_grad.zero_()
+                    except Exception:
+                        # If get_main_grad fails (e.g., buffer not yet allocated),
+                        # it's okay - the buffer will be zeroed when allocated
+                        pass
+        elif self.buffer is not None:
+            # Zero our standalone buffer
             self.buffer.zero_()
     
+    def sync_to_weight_grad(self):
+        """
+        Sync main_grad to weight.grad for optimizer.
+        
+        When using Megatron-FSDP, this is NOT needed because:
+        - Megatron-FSDP's optimizer reads from main_grad directly
+        - The gradient reduce happens on main_grad
+        
+        This method is for fallback mode (FSDP without Megatron main_grad).
+        Following Megatron-LM's approach: use to_local_if_dtensor for DTensor.
+        """
+        if self.uses_fsdp_main_grad:
+            # When using Megatron-FSDP, the optimizer uses main_grad directly
+            # No sync needed - just return
+            return
+        
+        if self.buffer is None:
+            return
+        
+        # Fallback mode: copy from our buffer to weight.grad
+        # For DTensor (FSDP sharded), we need to copy to _local_tensor
+        for name, weight, _ in self.weight_info:
+            main_grad = weight.get_main_grad()
+            
+            # Check if weight is DTensor
+            try:
+                from torch.distributed.tensor import DTensor
+                is_dtensor = isinstance(weight, DTensor)
+            except ImportError:
+                is_dtensor = False
+            
+            if weight.grad is None:
+                if is_dtensor:
+                    # For DTensor, create a zeros_like to get proper DTensor structure
+                    # then copy main_grad into its local tensor
+                    weight.grad = torch.zeros_like(weight)
+                    weight.grad._local_tensor.copy_(main_grad)
+                else:
+                    # For regular tensor, just clone
+                    weight.grad = main_grad.clone()
+            else:
+                # Get local grad tensor for DTensor (following Megatron-LM)
+                local_grad = to_local_if_dtensor(weight.grad)
+                local_grad.copy_(main_grad)
+    
     def get_buffer(self) -> torch.Tensor:
-        """Get the underlying contiguous buffer tensor."""
+        """Get the underlying contiguous buffer tensor (fallback mode only)."""
         return self.buffer
     
     def get_total_grad_norm(self, norm_type: float = 2.0) -> torch.Tensor:
         """Compute the gradient norm across all TE Linear weights."""
-        if self.buffer is None:
-            return torch.tensor(0.0)
-        return torch.norm(self.buffer, p=norm_type)
+        if self.uses_fsdp_main_grad:
+            # Compute norm across all main_grads
+            total_norm = torch.tensor(0.0, device='cuda')
+            for name, weight, _ in self.weight_info:
+                if hasattr(weight, 'main_grad') and weight.main_grad is not None:
+                    total_norm += torch.norm(weight.main_grad, p=norm_type) ** norm_type
+            return total_norm ** (1.0 / norm_type)
+        elif self.buffer is not None:
+            return torch.norm(self.buffer, p=norm_type)
+        return torch.tensor(0.0)
     
     def num_weights(self) -> int:
         """Return the number of weights managed by this buffer."""
@@ -421,11 +548,12 @@ def _patch_te_linear_for_fsdp():
                     result = torch.matmul(A_2d, B_2d)
                 
                 # Handle accumulate mode
+                # With overwrite_main_grad=False, TE passes accumulate=True (when is_first_microbatch=None)
+                # The buffer is zeroed at start of each step via te_grad_buffer.zero_grad()
+                # So we always use add_ to accumulate gradients across microbatches.
                 if accumulate:
-                    # Accumulate into out (add to existing gradients)
                     out.add_(result)
                 else:
-                    # First microbatch: copy result to out (overwrite)
                     out.copy_(result)
                 
                 # Handle bias gradient if needed
