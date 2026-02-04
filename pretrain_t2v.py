@@ -237,8 +237,11 @@ def train(model, text_encoder, vae, data_iter, optimizer, scheduler, criterion,
     accumulated_loss = 0.0
     
     for step in progress:
-        # Zero TE gradient buffer at the start of each step
-        if te_grad_buffer is not None:
+        # NOTE: When using Megatron-FSDP mode (te_grad_buffer.uses_fsdp_main_grad=True),
+        # Megatron-FSDP's optimizer.zero_grad() handles zeroing the gradient buffer.
+        # We should NOT manually zero it here, as it may interfere with FSDP's buffer management.
+        # Only zero for fallback mode (standalone buffer).
+        if te_grad_buffer is not None:  # Always zero - FSDP mode needs it too
             te_grad_buffer.zero_grad()
         
         # Accumulate gradients over micro-batches
@@ -265,13 +268,32 @@ def train(model, text_encoder, vae, data_iter, optimizer, scheduler, criterion,
             
             loss.backward()
             accumulated_loss += loss.item()
+            
+            # After first microbatch backward, reset overwrite_main_grad=False
+            # so subsequent microbatches will accumulate (add) their wgrads
+            if micro_idx == 0 and te_grad_buffer is not None and te_grad_buffer.uses_fsdp_main_grad:
+                te_grad_buffer.reset_overwrite_flag()
         
-        # Sync TE main_grad to weight.grad before optimizer step
-        # (TE writes to main_grad buffer, but optimizer reads weight.grad)
+        # NOTE: When using Megatron-FSDP mode, the optimizer reads from main_grad directly.
+        # Emulate Megatron-LM's _grad_acc behavior after all microbatches to
+        # avoid FSDP re-copying grads or overwriting TE-fused main_grads.
         if te_grad_buffer is not None:
-            te_grad_buffer.sync_to_weight_grad()
+            if te_grad_buffer.uses_fsdp_main_grad:
+                te_grad_buffer.apply_megatron_main_grad_accum()
+            else:
+                te_grad_buffer.sync_to_weight_grad()
         
         # Optimizer step
+        if te_grad_buffer is not None and te_grad_buffer.uses_fsdp_main_grad and rank == 0:
+            try:
+                grad_norm = te_grad_buffer.get_total_grad_norm().item()
+                logger.info(f"[DEBUG grad_norm] step={step} total_grad_norm={grad_norm:.6e}")
+                nan_info = te_grad_buffer.find_first_nan_in_main_grad()
+                if nan_info is not None:
+                    name, abs_max = nan_info
+                    logger.info(f"[DEBUG grad_norm] first_nonfinite={name} abs_max={abs_max:.6e}")
+            except Exception as e:
+                logger.info(f"[DEBUG grad_norm] step={step} failed: {e}")
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
@@ -349,7 +371,11 @@ def main():
         if is_te_available():
             # fuse_wgrad_accumulation requires specific GEMM dimension alignment
             logger.info(f"Replacing nn.Linear with TE Linear (fuse_wgrad_accumulation={args.te_fuse_wgrad})...")
-            model = replace_linear_with_te(model, fuse_wgrad_accumulation=args.te_fuse_wgrad, alignment=8)
+            model = replace_linear_with_te(
+                model,
+                fuse_wgrad_accumulation=args.te_fuse_wgrad,
+                alignment=8,
+            )
         else:
             logger.warning("TransformerEngine not available, skipping TE Linear replacement")
     

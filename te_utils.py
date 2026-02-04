@@ -208,6 +208,50 @@ def to_local_if_dtensor(tensor):
     return tensor
 
 
+# Map main_grad buffer pointers to their owning weights for flag sync
+_MAIN_GRAD_PTR_TO_PARAM = {}
+
+
+def _register_main_grad_ptr(weight: torch.Tensor):
+    """Register a mapping from main_grad data_ptr to its weight for flag sync."""
+    try:
+        main_grad = weight.get_main_grad()
+    except Exception:
+        return
+    main_grad_local = to_local_if_dtensor(main_grad)
+    orig_param = getattr(weight, "_orig_param_ref", None)
+    if orig_param is None:
+        orig_param = getattr(weight, "orig_param", None)
+    _MAIN_GRAD_PTR_TO_PARAM[main_grad_local.data_ptr()] = (weight, orig_param)
+
+
+def _mark_main_grad_added(out: torch.Tensor):
+    """Mark grad_added_to_main_grad on the owning weight (and orig_param if present)."""
+    out_local = to_local_if_dtensor(out)
+    entry = _MAIN_GRAD_PTR_TO_PARAM.get(out_local.data_ptr())
+    if entry is None:
+        return
+    weight, orig_param = entry
+    weight.grad_added_to_main_grad = True
+    if orig_param is not None:
+        orig_param.grad_added_to_main_grad = True
+
+
+def _should_overwrite_main_grad(out: torch.Tensor) -> bool:
+    """Decide overwrite/add based on per-weight grad_added_to_main_grad (Megatron-LM style)."""
+    out_local = to_local_if_dtensor(out)
+    entry = _MAIN_GRAD_PTR_TO_PARAM.get(out_local.data_ptr())
+    if entry is None:
+        # Conservative fallback: overwrite when unknown
+        return True
+    weight, orig_param = entry
+    if getattr(weight, "grad_added_to_main_grad", False):
+        return False
+    if orig_param is not None and getattr(orig_param, "grad_added_to_main_grad", False):
+        return False
+    return True
+
+
 class TEMainGradBuffer:
     """
     Gradient buffer manager for TE Linear layers with Megatron-FSDP.
@@ -244,6 +288,7 @@ class TEMainGradBuffer:
         self.alignment = alignment
         self.buffer = None  # Only used for fallback (non-FSDP)
         self.weight_info = []  # List of (name, weight, uses_fsdp_main_grad)
+        self._overwrite_flag = False  # Tracks whether first microbatch needs overwrite
         self.uses_fsdp_main_grad = False
         
         if not TE_AVAILABLE:
@@ -262,10 +307,17 @@ class TEMainGradBuffer:
         
         Megatron-FSDP sets up get_main_grad() method on each parameter.
         We check for this and use it directly if available.
+        
+        Key insight: After Megatron-FSDP wrapping, module.weight is a DTensor that
+        has an 'orig_param' attribute pointing to the original parameter. The original
+        parameter has get_main_grad/_gbuf/_item_id set by Megatron-FSDP, but these
+        attributes are NOT copied to the DTensor. We need to propagate them.
+        
         Otherwise, we create our own buffer (fallback for non-FSDP cases).
         """
         weights_with_fsdp_main_grad = []
         weights_without_main_grad = []
+        weights_propagated = 0
         
         for name, module in self.model.named_modules():
             if isinstance(module, te.Linear):
@@ -283,7 +335,42 @@ class TEMainGradBuffer:
                     if has_fsdp_main_grad:
                         weights_with_fsdp_main_grad.append((name, weight))
                     else:
+                        # Check if weight is a DTensor with orig_param that has get_main_grad
+                        # This happens when Megatron-FSDP replaces parameters with DTensors
+                        # but doesn't copy the main_grad attributes
+                        orig_param = getattr(weight, 'orig_param', None)
+                        if orig_param is not None:
+                            orig_has_main_grad = (
+                                hasattr(orig_param, 'get_main_grad') and
+                                hasattr(orig_param, '_gbuf') and
+                                hasattr(orig_param, '_item_id')
+                            )
+                            if orig_has_main_grad:
+                                # Propagate main_grad attributes from orig_param to DTensor
+                                weight._gbuf = orig_param._gbuf
+                                weight._item_id = orig_param._item_id
+                                weight.get_main_grad = orig_param.get_main_grad
+                                
+                                # CRITICAL: Sync grad_added_to_main_grad between weight and orig_param
+                                # Problem: TE Linear sets weight.grad_added_to_main_grad = True
+                                #          Megatron-FSDP checks orig_param.grad_added_to_main_grad
+                                #          These are different objects!
+                                # Solution: Store reference to orig_param so we can sync later
+                                weight._orig_param_ref = orig_param
+                                
+                                # Initialize the flag on both
+                                if not hasattr(orig_param, 'grad_added_to_main_grad'):
+                                    orig_param.grad_added_to_main_grad = False
+                                weight.grad_added_to_main_grad = False
+                                
+                                weights_with_fsdp_main_grad.append((name, weight))
+                                weights_propagated += 1
+                                continue
+                        
                         weights_without_main_grad.append((name, weight))
+        
+        if weights_propagated > 0:
+            print(f"Propagated get_main_grad from orig_param to DTensor for {weights_propagated} TE Linear layers")
         
         # Prefer using Megatron-FSDP's main_grad if available
         if weights_with_fsdp_main_grad:
@@ -294,6 +381,16 @@ class TEMainGradBuffer:
                 # Megatron-FSDP already set __fsdp_param__ = True and get_main_grad
                 # Just record the weight, don't override anything
                 self.weight_info.append((name, weight, True))
+                # Ensure grad_added_to_main_grad exists and starts False
+                if not hasattr(weight, 'grad_added_to_main_grad'):
+                    weight.grad_added_to_main_grad = False
+                orig_param = getattr(weight, "_orig_param_ref", None)
+                if orig_param is None:
+                    orig_param = getattr(weight, "orig_param", None)
+                if orig_param is not None and not hasattr(orig_param, 'grad_added_to_main_grad'):
+                    orig_param.grad_added_to_main_grad = False
+                # Register main_grad pointer for flag sync after wgrad
+                _register_main_grad_ptr(weight)
             
             print(f"Using Megatron-FSDP's get_main_grad for {len(weights_with_fsdp_main_grad)} TE Linear layers")
             print("  (No separate buffer needed - gradients accumulate in FSDP's grad buffer)")
@@ -369,28 +466,52 @@ class TEMainGradBuffer:
         
         print(f"Configured {len(weights_to_setup)} TE Linear layers with fallback main_grad buffer")
     
+    def _register_grad_flag_sync_hooks(self):
+        """Deprecated: flag sync is handled via main_grad pointer mapping."""
+        return
+    
     def zero_grad(self):
         """
         Zero the gradient buffer. Call at the start of each step.
         
-        When using Megatron-FSDP main_grad, this zeros those buffers via get_main_grad().
+        When using Megatron-FSDP main_grad, we set overwrite_main_grad=True on each
+        weight so that TE will use accumulate=False (copy instead of add) for the
+        first backward pass of this step. This effectively "zeros" the buffer by
+        overwriting it with the first wgrad.
+        
+        After the first backward completes (wgrad written), we reset overwrite_main_grad=False
+        so subsequent microbatches will accumulate (add) their wgrads.
+        
         When using fallback mode, this zeros our standalone buffer.
         """
         if self.uses_fsdp_main_grad:
-            # Zero each weight's main_grad (managed by Megatron-FSDP)
-            # Use get_main_grad() which returns a view into FSDP's grad buffer
-            for name, weight, _ in self.weight_info:
-                if hasattr(weight, 'get_main_grad'):
-                    try:
-                        main_grad = weight.get_main_grad()
-                        main_grad.zero_()
-                    except Exception:
-                        # If get_main_grad fails (e.g., buffer not yet allocated),
-                        # it's okay - the buffer will be zeroed when allocated
-                        pass
+            # Reset grad_added_to_main_grad flags for this step (Megatron-LM style)
+            for _, weight, _ in self.weight_info:
+                weight.grad_added_to_main_grad = False
+                orig_param = getattr(weight, "_orig_param_ref", None)
+                if orig_param is None:
+                    orig_param = getattr(weight, "orig_param", None)
+                if orig_param is not None:
+                    orig_param.grad_added_to_main_grad = False
+            # Debug
+            import torch.distributed as dist
+            if dist.is_initialized() and dist.get_rank() == 0:
+                print("[DEBUG zero_grad] Reset grad_added_to_main_grad flags")
         elif self.buffer is not None:
             # Zero our standalone buffer
             self.buffer.zero_()
+    
+    def reset_overwrite_flag(self):
+        """
+        Reset global overwrite flag after first microbatch backward.
+        
+        After this, subsequent microbatches will use add (accumulate) mode.
+        Note: _FIRST_WGRAD_IN_STEP is already reset inside patched_general_gemm
+        after the first wgrad, so this is mainly for clarity and consistency.
+        """
+        if self.uses_fsdp_main_grad:
+            # No-op for Megatron-LM style main_grad management
+            return
     
     def sync_to_weight_grad(self):
         """
@@ -436,6 +557,81 @@ class TEMainGradBuffer:
                 # Get local grad tensor for DTensor (following Megatron-LM)
                 local_grad = to_local_if_dtensor(weight.grad)
                 local_grad.copy_(main_grad)
+
+    def apply_megatron_main_grad_accum(self):
+        """
+        Emulate Megatron-LM's _grad_acc behavior for TE weights.
+
+        - If grad_added_to_main_grad is False and weight.grad is None, zero main_grad.
+        - If grad_added_to_main_grad is False and weight.grad exists, copy to main_grad.
+        - If grad_added_to_main_grad is True and weight.grad exists, drop weight.grad.
+        - Reset grad_added_to_main_grad to False for next step.
+        """
+        if not self.uses_fsdp_main_grad:
+            return
+        for name, weight, _ in self.weight_info:
+            orig_param = getattr(weight, "_orig_param_ref", None)
+            if orig_param is None:
+                orig_param = getattr(weight, "orig_param", None)
+
+            orig_flag = False
+            if orig_param is not None:
+                orig_flag = getattr(orig_param, "grad_added_to_main_grad", False)
+            weight_flag = getattr(weight, "grad_added_to_main_grad", False)
+            flag = orig_flag or weight_flag
+
+            if not flag:
+                try:
+                    main_grad = weight.get_main_grad()
+                except Exception:
+                    main_grad = None
+                if main_grad is not None:
+                    if weight.grad is not None:
+                        local_grad = to_local_if_dtensor(weight.grad)
+                        if main_grad.numel() != local_grad.numel():
+                            # Guard against unexpected shape mismatches.
+                            try:
+                                import torch.distributed as dist
+                                rank = dist.get_rank() if dist.is_initialized() else 0
+                                if rank == 0:
+                                    print(
+                                        "[WARN main_grad] shape mismatch: "
+                                        f"name={name} "
+                                        f"rank={rank} "
+                                        f"main_grad={tuple(main_grad.shape)} "
+                                        f"grad={tuple(local_grad.shape)}"
+                                    )
+                            except Exception:
+                                pass
+                            main_grad.zero_()
+                            del weight.grad
+                        else:
+                            main_grad.copy_(local_grad.view_as(main_grad))
+                            del weight.grad
+                    else:
+                        main_grad.zero_()
+            else:
+                if weight.grad is not None:
+                    del weight.grad
+
+            # Reset flags (Megatron-LM style)
+            weight.grad_added_to_main_grad = False
+            if orig_param is not None:
+                orig_param.grad_added_to_main_grad = False
+
+    def install_fsdp_post_backward_hook(self, fsdp_module: nn.Module):
+        """
+        Register a post-backward hook on the FSDP wrapper to mirror Megatron-LM _grad_acc timing.
+        """
+        if not self.uses_fsdp_main_grad:
+            return
+        if hasattr(self, "_post_bwd_hook_handle") and self._post_bwd_hook_handle is not None:
+            return
+
+        def _post_bwd_hook(_module, _grad_input, _grad_output):
+            self.apply_megatron_main_grad_accum()
+
+        self._post_bwd_hook_handle = fsdp_module.register_full_backward_hook(_post_bwd_hook)
     
     def get_buffer(self) -> torch.Tensor:
         """Get the underlying contiguous buffer tensor (fallback mode only)."""
@@ -447,12 +643,43 @@ class TEMainGradBuffer:
             # Compute norm across all main_grads
             total_norm = torch.tensor(0.0, device='cuda')
             for name, weight, _ in self.weight_info:
-                if hasattr(weight, 'main_grad') and weight.main_grad is not None:
-                    total_norm += torch.norm(weight.main_grad, p=norm_type) ** norm_type
+                main_grad = None
+                if hasattr(weight, 'get_main_grad'):
+                    try:
+                        main_grad = weight.get_main_grad()
+                    except Exception:
+                        main_grad = None
+                if main_grad is None and hasattr(weight, 'main_grad'):
+                    main_grad = weight.main_grad
+                if main_grad is not None:
+                    total_norm += torch.norm(main_grad, p=norm_type) ** norm_type
             return total_norm ** (1.0 / norm_type)
         elif self.buffer is not None:
             return torch.norm(self.buffer, p=norm_type)
         return torch.tensor(0.0)
+
+    def find_first_nan_in_main_grad(self):
+        """Return (name, abs_max) for the first main_grad containing NaN/Inf."""
+        if not self.uses_fsdp_main_grad:
+            return None
+        for name, weight, _ in self.weight_info:
+            main_grad = None
+            if hasattr(weight, 'get_main_grad'):
+                try:
+                    main_grad = weight.get_main_grad()
+                except Exception:
+                    main_grad = None
+            if main_grad is None and hasattr(weight, 'main_grad'):
+                main_grad = weight.main_grad
+            if main_grad is None:
+                continue
+            if not torch.isfinite(main_grad).all():
+                try:
+                    abs_max = main_grad.abs().max().item()
+                except Exception:
+                    abs_max = float("nan")
+                return name, abs_max
+        return None
     
     def num_weights(self) -> int:
         """Return the number of weights managed by this buffer."""
@@ -486,6 +713,7 @@ def setup_main_grad_for_te_linear(model: nn.Module) -> TEMainGradBuffer:
 
 _TE_PATCHED = False
 _ORIGINAL_GENERAL_GEMM = None
+_OVERWRITE_MAIN_GRAD = False  # Legacy: kept for fallback mode only
 
 def _patch_te_linear_for_fsdp():
     """
@@ -537,6 +765,12 @@ def _patch_te_linear_for_fsdp():
                 A_2d = A.reshape(-1, A.shape[-1]) if A.dim() == 3 else A
                 B_2d = B.reshape(-1, B.shape[-1]) if B.dim() == 3 else B
                 
+                # If out is FP32, do matmul in FP32 for stability
+                compute_dtype = out.dtype if out is not None else A_2d.dtype
+                if compute_dtype == torch.float32 and A_2d.dtype != torch.float32:
+                    A_2d = A_2d.float()
+                    B_2d = B_2d.float()
+                
                 if layout == "NT":
                     # dW = B^T @ A -> [out_features, batch*seq] @ [batch*seq, in_features]
                     result = torch.matmul(B_2d.t(), A_2d)
@@ -547,14 +781,43 @@ def _patch_te_linear_for_fsdp():
                     # NN layout
                     result = torch.matmul(A_2d, B_2d)
                 
-                # Handle accumulate mode
-                # With overwrite_main_grad=False, TE passes accumulate=True (when is_first_microbatch=None)
-                # The buffer is zeroed at start of each step via te_grad_buffer.zero_grad()
-                # So we always use add_ to accumulate gradients across microbatches.
-                if accumulate:
-                    out.add_(result)
+                if out is not None and result.dtype != out.dtype:
+                    result = result.to(out.dtype)
+                
+                # Handle accumulate mode using per-weight grad_added_to_main_grad
+                # This matches Megatron-LM behavior and avoids stale buffer accumulation.
+                
+                # DEBUG: Show actual mode used (first few times only)
+                global _DEBUG_WGRAD_COUNT
+                if '_DEBUG_WGRAD_COUNT' not in globals():
+                    _DEBUG_WGRAD_COUNT = 0
+                if _DEBUG_WGRAD_COUNT < 10:
+                    _DEBUG_WGRAD_COUNT += 1
+                    import torch.distributed as dist
+                    rank = dist.get_rank() if dist.is_initialized() else 0
+                    if rank == 0:
+                        overwrite = _should_overwrite_main_grad(out)
+                        mode = "COPY" if overwrite else "ADD"
+                        print(f"[DEBUG wgrad] shape={result.shape}, mode={mode}")
+                        # Log wgrad stats for early iterations
+                        try:
+                            res_max = result.abs().max().item()
+                            res_mean = result.abs().mean().item()
+                            print(f"[DEBUG wgrad] abs_max={res_max:.6e}, abs_mean={res_mean:.6e}")
+                        except Exception:
+                            pass
+                
+                # Apply alpha scaling if provided
+                if alpha is not None and alpha != 1.0:
+                    result = result.mul(alpha)
+                
+                if _should_overwrite_main_grad(out):
+                    out.copy_(result)  # First microbatch: overwrite
                 else:
-                    out.copy_(result)
+                    out.add_(result)   # Subsequent microbatches: accumulate
+
+                # Sync grad_added_to_main_grad to orig_param via main_grad mapping
+                _mark_main_grad_added(out)
                 
                 # Handle bias gradient if needed
                 grad_bias = None
